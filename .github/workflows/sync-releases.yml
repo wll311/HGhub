@@ -1,0 +1,141 @@
+name: Sync upstream releases
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 */6 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-releases
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'wll311/HGhub'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Copy published releases and assets
+        shell: node {0}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_REPO: Minireel/HGhub
+          GH_PROMPT_DISABLED: "1"
+        run: |
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const crypto = require('node:crypto');
+          const { execFileSync } = require('node:child_process');
+
+          function run(command, args) {
+            return execFileSync(command, args, {
+              encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit']
+            }).trim();
+          }
+          const gh = (...args) => run('gh', args);
+          function listReleases(repo) {
+            return JSON.parse(gh('api', '--paginate', '--slurp',
+              `repos/${repo}/releases?per_page=100`)).flat();
+          }
+          function sameAsset(a, b) {
+            return b && b.state === 'uploaded' && a.name === b.name &&
+              a.size === b.size && (!a.digest || !b.digest || a.digest === b.digest);
+          }
+
+          async function main() {
+            const upstream = process.env.UPSTREAM_REPO;
+            const target = process.env.GITHUB_REPOSITORY;
+            const prefix = '<!-- hghub-release-sync:';
+            const releases = listReleases(upstream).filter(r => !r.draft)
+              .sort((a, b) => a.published_at.localeCompare(b.published_at));
+            const existing = new Map(listReleases(target).map(r => [r.tag_name, r]));
+            let copied = 0;
+            let skipped = 0;
+
+            for (const release of releases) {
+              const tag = release.tag_name;
+              const previous = existing.get(tag);
+              const manifest = release.assets.map(a => [a.id, a.name, a.size, a.digest || null])
+                .sort((a, b) => a[1].localeCompare(b[1]));
+              const fingerprint = crypto.createHash('sha256').update(JSON.stringify([
+                release.id, release.updated_at, release.name, release.body,
+                release.prerelease, manifest
+              ])).digest('hex');
+              const marker = `${prefix}${fingerprint} -->`;
+
+              if (previous && !previous.draft && (previous.body || '').includes(marker) &&
+                  release.assets.every(a => sameAsset(a,
+                    previous.assets.find(b => b.name === a.name)))) {
+                console.log(`Skip ${tag}: already synchronized`);
+                skipped++;
+                continue;
+              }
+              if (previous && !(previous.body || '').includes(prefix)) {
+                throw new Error(`Release ${tag} already exists and was not created by this workflow; refusing to overwrite it.`);
+              }
+              for (const asset of release.assets) {
+                if (path.basename(asset.name) !== asset.name ||
+                    ['.', '..'].includes(asset.name) || asset.name.includes('#')) {
+                  throw new Error(`Unsupported asset filename: ${asset.name}`);
+                }
+              }
+
+              console.log(`Synchronizing ${tag}`);
+              const dir = fs.mkdtempSync(path.join(process.env.RUNNER_TEMP, 'release-sync-'));
+              const assetsDir = path.join(dir, 'assets');
+              fs.mkdirSync(assetsDir);
+              const notes = path.join(dir, 'notes.md');
+              fs.writeFileSync(notes,
+                `${release.body || ''}\n\n---\n同步自：${release.html_url}\n\n${marker}\n`);
+
+              // Copy the original tag so source archives match the upstream version.
+              // The push does not use force, and no branch is pushed.
+              run('git', ['fetch', '--no-tags', `https://github.com/${upstream}.git`,
+                `refs/tags/${tag}:refs/tags/${tag}`]);
+              run('git', ['push', 'origin', `refs/tags/${tag}:refs/tags/${tag}`]);
+
+              if (release.assets.length) {
+                gh('release', 'download', tag, '--repo', upstream, '--dir', assetsDir);
+              }
+              const files = [];
+              for (const asset of release.assets) {
+                const file = path.join(assetsDir, asset.name);
+                if (fs.statSync(file).size !== asset.size) {
+                  throw new Error(`Size mismatch: ${asset.name}`);
+                }
+                if (asset.digest && asset.digest.startsWith('sha256:')) {
+                  const hash = crypto.createHash('sha256');
+                  for await (const chunk of fs.createReadStream(file)) hash.update(chunk);
+                  if (`sha256:${hash.digest('hex')}` !== asset.digest) {
+                    throw new Error(`SHA256 mismatch: ${asset.name}`);
+                  }
+                }
+                files.push(file);
+              }
+
+              if (!previous) {
+                gh('release', 'create', tag, '--repo', target, '--verify-tag', '--draft',
+                  '--title', release.name || tag, '--notes-file', notes,
+                  `--prerelease=${release.prerelease}`);
+              }
+              if (files.length) {
+                gh('release', 'upload', tag, ...files, '--repo', target, '--clobber');
+              }
+              gh('release', 'edit', tag, '--repo', target, '--title', release.name || tag,
+                '--notes-file', notes, `--prerelease=${release.prerelease}`, '--draft=false');
+              copied++;
+            }
+            const summary = `已同步 ${copied} 个版本；已是最新的 ${skipped} 个版本。\n`;
+            console.log(summary);
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary);
+          }
+
+          main().catch(error => {
+            console.error(error.message);
+            process.exitCode = 1;
+          });
